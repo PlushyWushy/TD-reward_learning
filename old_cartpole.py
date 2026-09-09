@@ -5,7 +5,10 @@ Loss:   TD(0) target  r + gamma * E_{a' ~ pi}[V(s', a')]
 """
 
 import argparse
+import datetime
+from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn as nn
 import gymnasium as gym
@@ -38,7 +41,14 @@ def main() -> None:
     parser.add_argument("--stop-after", type=int, default=100,
                         help="stop if avg over this many episodes >= goal")
     parser.add_argument("--goal", type=float, default=450.0)
+    parser.add_argument("--run-dir", type=str, default=None,
+                        help="where to save models/metrics "
+                             "(default: runs/<timestamp>)")
     args = parser.parse_args()
+
+    run_dir = Path(args.run_dir) if args.run_dir else (
+        Path("runs") / datetime.datetime.now().strftime("%Y%m%d-%H%M%S"))
+    run_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(args.seed)
     env = gym.make("CartPole-v1")
@@ -47,9 +57,13 @@ def main() -> None:
     std = torch.tensor([2.4, 32.0, 0.419, 4.712])
 
     model = MLP(hidden=args.hidden)
+    torch.save(model.state_dict(), run_dir / "initial_model.pt")
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
 
     scores: list[float] = []
+    step_rewards: list[float] = []
+    step_td_errors: list[float] = []
+    step_episode: list[int] = []
     for ep in range(1, args.episodes + 1):
         state, _ = env.reset(seed=args.seed + ep)
         xs, acts, rews, nexts, dones = [], [], [], [], []
@@ -81,10 +95,15 @@ def main() -> None:
                     p_next = (v_next / args.temperature).softmax(dim=-1)
                     boot = (p_next * v_next).sum(dim=-1)
                 target[mask] += args.gamma * boot[mask]
-                loss = (model(s).gather(1, act.unsqueeze(1)).squeeze(1) - target).pow(2).mean()
+                pred = model(s).gather(1, act.unsqueeze(1)).squeeze(1)
+                loss = (pred - target).pow(2).mean()
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
+
+                step_td_errors.extend((target - pred).detach().tolist())
+                step_rewards.extend(rews)
+                step_episode.extend([ep] * len(rews))
                 xs, acts, rews, nexts, dones = [], [], [], [], []
             if done:
                 break
@@ -99,6 +118,16 @@ def main() -> None:
 
     best = max(scores)
     print(f"done. best score {best:.0f} over {len(scores)} episodes")
+
+    torch.save(model.state_dict(), run_dir / "trained_model.pt")
+    np.savez(
+        run_dir / "metrics.npz",
+        episode_rewards=np.array(scores, dtype=np.float32),
+        step_rewards=np.array(step_rewards, dtype=np.float32),
+        step_td_errors=np.array(step_td_errors, dtype=np.float32),
+        step_episode=np.array(step_episode, dtype=np.int64),
+    )
+    print(f"saved initial/trained models and metrics to {run_dir}/")
 
 
 if __name__ == "__main__":
